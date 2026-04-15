@@ -1,4 +1,6 @@
 // Do the physics here! 
+// Inspired by S. Richers' and collaborators' implementation in EMU: https://github.com/AMReX-Astro/Emu
+
 #pragma once
 #include <array>
 #include <algorithm>
@@ -6,115 +8,161 @@
 #include "integrators.h"
 #include "state.h"
 #include "grid.h"
+#include "parameters.h"
 using namespace std;
 
 // -----------------------------------------------------------------------------
 // Setup Boundary Conditions - Need Ghost Cells for Periodic!
 // -----------------------------------------------------------------------------
-template<int N, int NG>
-void apply_boundary_conditions(std::array<std::array<double, N>, 2>& state)
-{
-    static_assert(NG >= 1, "Need at least one ghost zone for this implementation.");
 
+template<int nx, int nghost>
+void apply_boundary_conditions(array<array<DensityMatrix, nx>, 2>& state) {
     if constexpr (boundary_condition == periodic) {
-        // Left ghost(s) from right interior
-        for (int g = 0; g < NG; g++) {
-            state[0][g] = state[0][N - 2*NG + g];
-            state[1][g] = state[1][N - 2*NG + g];
+       for (int g = 0; g < nghost; g++) {
+            state[0][g] = state[0][nx - 2*nghost + g];
+            state[1][g] = state[1][nx - 2*nghost + g];
         }
 
-        // Right ghost(s) from left interior
-        for (int g = 0; g < NG; g++) {
-            state[0][N - NG + g] = state[0][NG + g];
-            state[1][N - NG + g] = state[1][NG + g];
+        // Right ghosts ← Left interior
+        for (int g = 0; g < nghost; g++) {
+            state[0][nx - nghost + g] = state[0][nghost + g];
+            state[1][nx - nghost + g] = state[1][nghost + g];
         }
     }
     else if constexpr (boundary_condition == reflecting) {
-        // At a reflecting wall, f+ <-> f- swap at the boundary
-        for (int g = 0; g < NG; g++) {
-            state[0][g]         = state[1][2*NG - 1 - g];
-            state[1][g]         = state[0][2*NG - 1 - g];
-
-            state[0][N - NG + g] = state[1][N - NG - 1 - g];
-            state[1][N - NG + g] = state[0][N - NG - 1 - g];
+      // Left boundary
+        for (int g = 0; g < nghost; g++) {
+            DensityMatrix temp_plus = state[0][2*nghost - 1 - g];
+            DensityMatrix temp_minus = state[1][2*nghost - 1 - g];
+            
+            state[0][g] = temp_minus;  // Right-moving ← Left-moving
+            state[1][g] = temp_plus;   // Left-moving ← Right-moving
         }
+        // Right boundary
+        for (int g = 0; g < nghost; g++) {
+            DensityMatrix temp_plus = state[0][nx - 2*nghost + g];
+            DensityMatrix temp_minus = state[1][nx - 2*nghost + g];
+            
+            state[0][nx - nghost + g] = temp_minus;  // Right-moving ← Left-moving
+            state[1][nx - nghost + g] = temp_plus;   // Left-moving ← Right-moving
+        }   
+
+
     }
     else if constexpr (boundary_condition == outflow) {
-        for (int g = 0; g < NG; g++) {
-            state[0][g]          = state[0][NG];
-            state[1][g]          = state[1][NG];
-            state[0][N - NG + g] = state[0][N - NG - 1];
-            state[1][N - NG + g] = state[1][N - NG - 1];
+        // Copy nearest interior to ghosts
+        for (int g = 0; g < nghost; g++) {
+            state[0][g] = state[0][nghost];             // Left ghost ← First interior
+            state[1][g] = state[1][nghost];
+            
+            state[0][nx - nghost + g] = state[0][nx - nghost - 1];  // Right ghost ← Last interior
+            state[1][nx - nghost + g] = state[1][nx - nghost - 1];
         }
     }
 }
 
-template<typename RHS>
-void apply_integrator(State& state, double dt, RHS rhs)
-{
-    if constexpr (integrator == rk2) {
-        Integrators::rk2(state, dt, rhs);
-    }
-    else if constexpr (integrator == rk4) {
-        Integrators::rk4(state, dt, rhs);
-    }
-    else if constexpr (integrator == forward_euler) {
-        Integrators::forward_euler(state, dt, rhs);
-    }
+// -----------------------------------------------------------------------------
+// Compute Hamiltonian Commutator: -i[H, ρ]
+// This is the quantum mechanical term responsible for flavor oscillations
+// -----------------------------------------------------------------------------
+inline DensityMatrix compute_commutator(const DensityMatrix& rho, const VacuumHamiltonian& H) {
+    // For 2x2 Hermitian matrices:
+    // f = [ f_ee        f_ex - i*f_ex_conj ]
+    //     [ f_ex + i*f_ex_conj    f_xx     ]
+    //
+    // H = [ H_ee    H_ex ]
+    //     [ H_ex    H_xx ]
+
+    DensityMatrix result;
+    result.f_ee = +2.0 * H.H_ex * rho.f_ex_conj;
+    result.f_xx = -result.f_ee;  // Opposite sign for conservation
+    result.f_ex = H.H_ex * (rho.f_xx - rho.f_ee);
+    result.f_ex_conj = -(H.H_ee - H.H_xx) * rho.f_ex;
+    
+    return result;
 }
 
-
-
 // -----------------------------------------------------------------------------
-// Compute RHS of Discrete, Two-Angle Boltzmann Equation
+// Calculate Vacuum Oscillation Component to Change in Flavor
+// 
+// Compute RHS of Discrete, Two-Angle Boltzmann Equation with Oscillations
 // -----------------------------------------------------------------------------
-template<int N>
-std::array<std::array<double, N>, 2>
-compute_rhs(const std::array<std::array<double, N>, 2>& state,
-            const std::array<std::array<double, N>, 3>& moments,
-            double dx,
-            double* max_signal_speed)
-{
-    std::array<std::array<double, N>, 2> dstate_dt{};
+template<int nx>
+array<array<DensityMatrix, nx>, 2> compute_rhs_with_oscillations(
+    const array<array<DensityMatrix, nx>, 2>& state,
+    const array<array<array<double, nx>, 3>, 2>& moments,
+    double dx, double dt, double* max_speed) {
+    
+    array<array<DensityMatrix, nx>, 2> dstate_dt{};
 
-    *max_signal_speed = std::abs(c_light * mu0);
+    // Compute vacuum Hamiltonian (energy-dependent in full code)
+    double omega_vac = compute_omega_vac(E_neutrino_MeV);
+    VacuumHamiltonian H_vac(omega_vac);
 
-    // only update valid cells, not ghosts
-    for (int i = nghost; i < N - nghost; i++) {
-        const double fplus  = state[0][i];
-        const double fminus = state[1][i];
-        const double J      = moments[0][i];
+    *max_speed = abs(c_light * mu0);
 
-        // up-wind streaming terms; approximate advection 
-        // f+ travels right, so backward difference
-        const double dfdx_plus =
-            (state[0][i] - state[0][i - 1]) / dx;
-
-        // f- travels left, so forward difference
-        const double dfdx_minus =
-            (state[1][i + 1] - state[1][i]) / dx;
-
-        // collision/source pieces
-        const double collision_plus =
-            kappa * (f_eq - fplus) + sigma_s * (J - fplus);
-
-        const double collision_minus =
-            kappa * (f_eq - fminus) + sigma_s * (J - fminus);
-
-        dstate_dt[0][i] =
-            -c_light * mu0 * dfdx_plus + collision_plus;
-
-        dstate_dt[1][i] =
-            +c_light * mu0 * dfdx_minus + collision_minus;
+    // Loop over interior zones (exclude ghosts)
+    for (int i = nghost; i < nx - nghost; i++) {
+        
+        // ===== DIRECTION 0: f_plus (μ > 0, moving right) =====
+        
+        // Upwind derivative (backward difference for rightward motion)
+        DensityMatrix dfdx_plus;
+        dfdx_plus.f_ee = (state[0][i].f_ee - state[0][i-1].f_ee) / dx;
+        dfdx_plus.f_ex = (state[0][i].f_ex - state[0][i-1].f_ex) / dx;
+        dfdx_plus.f_ex_conj = (state[0][i].f_ex_conj - state[0][i-1].f_ex_conj) / dx;
+        dfdx_plus.f_xx = (state[0][i].f_xx - state[0][i-1].f_xx) / dx;
+        
+        // Streaming term: -μ₀ c ∂f/∂x
+        DensityMatrix streaming_plus = (-c_light * mu0) * dfdx_plus;
+        
+        // Oscillation term: -i[H, ρ]
+        DensityMatrix oscillation_plus = compute_commutator(state[0][i], H_vac);
+        
+        // Collision term (placeholder - set to zero for pure oscillation test)
+        DensityMatrix collision_plus(0.0, 0.0, 0.0, 0.0);
+        
+        // Total RHS for f_plus
+        dstate_dt[0][i] = streaming_plus + oscillation_plus + collision_plus;
+        
+        
+        // ===== DIRECTION 1: f_minus (μ < 0, moving left) =====
+        
+        // Upwind derivative (forward difference for leftward motion)
+        DensityMatrix dfdx_minus;
+        dfdx_minus.f_ee = (state[1][i+1].f_ee - state[1][i].f_ee) / dx;
+        dfdx_minus.f_ex = (state[1][i+1].f_ex - state[1][i].f_ex) / dx;
+        dfdx_minus.f_ex_conj = (state[1][i+1].f_ex_conj - state[1][i].f_ex_conj) / dx;
+        dfdx_minus.f_xx = (state[1][i+1].f_xx - state[1][i].f_xx) / dx;
+        
+        // Streaming term: -μ₀ c ∂f/∂x  (note: μ₀ < 0 for this direction)
+        DensityMatrix streaming_minus = (-c_light * (-mu0)) * dfdx_minus;
+        
+        // Oscillation term: -i[H, ρ]
+        DensityMatrix oscillation_minus = compute_commutator(state[1][i], H_vac);
+        
+        // Collision term (placeholder)
+        DensityMatrix collision_minus(0.0, 0.0, 0.0, 0.0);
+        
+        // Total RHS for f_minus
+        dstate_dt[1][i] = streaming_minus + oscillation_minus + collision_minus;
     }
-
-    // keep ghost-zone RHS zero! No sources there.
-    for (int i = 0; i < nghost; i++) {
-        dstate_dt[0][i] = 0.0;
-        dstate_dt[1][i] = 0.0;
-        dstate_dt[0][N - 1 - i] = 0.0;
-        dstate_dt[1][N - 1 - i] = 0.0;
-    }
-
+    
     return dstate_dt;
+}
+
+// -----------------------------------------------------------------------------
+// Wrapper to apply integrator based on compile-time choice
+// -----------------------------------------------------------------------------
+template<typename RHS>
+void apply_integrator_choice(DensityMatrix& state_elem, double dt, RHS rhs) {
+    if constexpr (integrator == rk2) {
+        Integrators::rk2(state_elem, dt, rhs);
+    }
+    else if constexpr (integrator == rk4) { 
+        Integrators::rk4(state_elem, dt, rhs);
+    }
+    else if constexpr (integrator == forward_euler) {
+        Integrators::forward_euler(state_elem, dt, rhs);
+    }
 }
