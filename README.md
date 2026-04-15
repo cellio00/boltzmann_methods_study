@@ -6,3 +6,20 @@ and explore the difficulties that even overly simplified physical problems can p
 
 
 Please reach out if you would like to collaborate, play yourself, or expand on what the code does. 
+
+Compile:
+
+make clean
+make 
+
+
+Adjust runtime parameters:
+parameters.h 
+
+
+Execute:
+./boltzmann_solver
+
+
+evaluate results:
+python3 plot_results.py --save-gif 
